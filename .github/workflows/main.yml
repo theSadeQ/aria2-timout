@@ -7,7 +7,6 @@ on:
 
 jobs:
   save-file:
-    # Avoid re-running on the bot's own commit
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     permissions:
@@ -28,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
+          shopt -s nullglob dotglob
 
           MSG="$(git log -1 --pretty=%B)"
           echo "Commit message:"
@@ -83,8 +82,6 @@ jobs:
             echo "   $url"
             echo "   timeout: $TIMEOUT_VALUE"
 
-            # For magnets/torrents, aria2 chooses filenames from metadata.
-            # For direct URLs, it uses server-provided or URL-derived name.
             timeout "$TIMEOUT_VALUE" aria2c \
               --continue=true \
               --max-tries=1 \
@@ -95,14 +92,12 @@ jobs:
               --bt-tracker-connect-timeout=30 \
               --bt-stop-timeout=180 \
               --seed-time=0 \
-              --follow-torrent=true \
+              --follow-torrent=mem \
+              --bt-save-metadata=false \
               --dir="tmp_downloads" \
               "$url"
           }
 
-          # Current format expects space-separated URLs on the same command line.
-          # Example:
-          # download-small: magnet:?xt=... https://example.com/file.iso
           for URL in $URL_LINE; do
             if ! download_one "$URL"; then
               echo "❌ Download failed or timed out: $URL"
@@ -110,9 +105,13 @@ jobs:
             fi
           done
 
-          # If zip mode is requested, create one archive from all downloaded files.
+          echo "🧹 Removing leftover .torrent files, if any..."
+          find tmp_downloads -type f -name "*.torrent" -delete
+
+          echo "📁 Downloaded content:"
+          find tmp_downloads -maxdepth 3 -print
+
           if [ "$MODE" = "zip" ]; then
-            ARCHIVE_NAME="tmp_downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
             FILES=(tmp_downloads/*)
 
             if [ "${#FILES[@]}" -eq 0 ]; then
@@ -120,18 +119,55 @@ jobs:
               exit 1
             fi
 
-            echo "📦 Creating archive: $ARCHIVE_NAME"
-            zip -j "$ARCHIVE_NAME" tmp_downloads/*
+            ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
+
+            echo "📦 Creating one archive from downloaded content: $ARCHIVE_NAME"
+
+            (
+              cd tmp_downloads
+              zip -r "../downloads/$ARCHIVE_NAME" .
+            )
+
+          else
+            echo "📤 Preparing normal output..."
+
+            ITEMS=(tmp_downloads/*)
+
+            if [ "${#ITEMS[@]}" -eq 0 ]; then
+              echo "❌ No downloaded content found."
+              exit 1
+            fi
+
+            for ITEM in "${ITEMS[@]}"; do
+              BASENAME="$(basename "$ITEM")"
+
+              if [ -d "$ITEM" ]; then
+                echo "📁 Torrent produced folder: $BASENAME"
+                echo "📦 Zipping folder so it can be stored cleanly..."
+
+                (
+                  cd tmp_downloads
+                  zip -r "../downloads/${BASENAME}.zip" "$BASENAME"
+                )
+
+              elif [ -f "$ITEM" ]; then
+                echo "✅ Copying downloaded file: $BASENAME"
+                cp "$ITEM" "downloads/$BASENAME"
+              fi
+            done
           fi
 
-          # Split any file larger than 90 MB into unzip-compatible zip parts.
-          LIMIT=$((90 * 1024 * 1024))
+          rm -rf tmp_downloads
 
-          for FILE in tmp_downloads/*; do
+          echo "🔍 Checking files larger than 90 MB..."
+          LIMIT=$((90 * 1024 * 1024))
+          mkdir -p final_downloads
+
+          for FILE in downloads/*; do
             [ -f "$FILE" ] || continue
 
-            SIZE=$(stat -c%s "$FILE")
-            BASENAME=$(basename "$FILE")
+            SIZE="$(stat -c%s "$FILE")"
+            BASENAME="$(basename "$FILE")"
 
             if [ "$SIZE" -gt "$LIMIT" ]; then
               echo "✂️ Splitting large file: $BASENAME ($(( SIZE / 1024 / 1024 )) MB)"
@@ -142,17 +178,18 @@ jobs:
 
               (
                 cd split_tmp
-                zip -s 90m -r "../downloads/${BASENAME}.zip" "$BASENAME"
+                zip -s 90m -r "../final_downloads/${BASENAME}.zip" "$BASENAME"
               )
 
               rm -rf split_tmp
             else
-              echo "✅ Copying file without split: $BASENAME"
-              cp "$FILE" "downloads/$BASENAME"
+              echo "✅ Keeping file without split: $BASENAME"
+              cp "$FILE" "final_downloads/$BASENAME"
             fi
           done
 
-          rm -rf tmp_downloads
+          rm -rf downloads
+          mv final_downloads downloads
 
           echo "📁 Final files in downloads/:"
           ls -lah downloads || true
