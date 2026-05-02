@@ -1,0 +1,179 @@
+name: Download from Commit & Save to Repo
+
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  save-file:
+    # Avoid re-running on the bot's own commit
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip unzip
+
+      - name: Extract URLs, download files, and prepare outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          MSG="$(git log -1 --pretty=%B)"
+          echo "Commit message:"
+          echo "----------------------------------------"
+          echo "$MSG"
+          echo "----------------------------------------"
+
+          MODE=""
+          TIMEOUT_VALUE=""
+          URL_LINE=""
+
+          if echo "$MSG" | grep -qP 'download-zip-small:\s*'; then
+            MODE="zip"
+            TIMEOUT_VALUE="7m"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-zip-small:\s*\K.*')"
+          elif echo "$MSG" | grep -qP 'download-zip-big:\s*'; then
+            MODE="zip"
+            TIMEOUT_VALUE="15m"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-zip-big:\s*\K.*')"
+          elif echo "$MSG" | grep -qP 'download-small:\s*'; then
+            MODE="normal"
+            TIMEOUT_VALUE="7m"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-small:\s*\K.*')"
+          elif echo "$MSG" | grep -qP 'download-big:\s*'; then
+            MODE="normal"
+            TIMEOUT_VALUE="15m"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-big:\s*\K.*')"
+          else
+            echo "❌ No valid download command found."
+            echo "Use one of:"
+            echo "  download-small: <url-or-magnet>"
+            echo "  download-big: <url-or-magnet>"
+            echo "  download-zip-small: <url-or-magnet>"
+            echo "  download-zip-big: <url-or-magnet>"
+            exit 1
+          fi
+
+          if [ -z "${URL_LINE// }" ]; then
+            echo "❌ Download command found, but no URL/magnet provided."
+            exit 1
+          fi
+
+          echo "Mode: $MODE"
+          echo "Timeout: $TIMEOUT_VALUE"
+
+          mkdir -p downloads tmp_downloads
+
+          download_one() {
+            local url="$1"
+
+            echo "⬇️ Downloading:"
+            echo "   $url"
+            echo "   timeout: $TIMEOUT_VALUE"
+
+            # For magnets/torrents, aria2 chooses filenames from metadata.
+            # For direct URLs, it uses server-provided or URL-derived name.
+            timeout "$TIMEOUT_VALUE" aria2c \
+              --continue=true \
+              --max-tries=1 \
+              --retry-wait=5 \
+              --timeout=30 \
+              --connect-timeout=30 \
+              --bt-tracker-timeout=30 \
+              --bt-tracker-connect-timeout=30 \
+              --bt-stop-timeout=180 \
+              --seed-time=0 \
+              --follow-torrent=true \
+              --dir="tmp_downloads" \
+              "$url"
+          }
+
+          # Current format expects space-separated URLs on the same command line.
+          # Example:
+          # download-small: magnet:?xt=... https://example.com/file.iso
+          for URL in $URL_LINE; do
+            if ! download_one "$URL"; then
+              echo "❌ Download failed or timed out: $URL"
+              exit 1
+            fi
+          done
+
+          # If zip mode is requested, create one archive from all downloaded files.
+          if [ "$MODE" = "zip" ]; then
+            ARCHIVE_NAME="tmp_downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
+            FILES=(tmp_downloads/*)
+
+            if [ "${#FILES[@]}" -eq 0 ]; then
+              echo "❌ No files downloaded to archive."
+              exit 1
+            fi
+
+            echo "📦 Creating archive: $ARCHIVE_NAME"
+            zip -j "$ARCHIVE_NAME" tmp_downloads/*
+          fi
+
+          # Split any file larger than 90 MB into unzip-compatible zip parts.
+          LIMIT=$((90 * 1024 * 1024))
+
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️ Splitting large file: $BASENAME ($(( SIZE / 1024 / 1024 )) MB)"
+
+              rm -rf split_tmp
+              mkdir -p split_tmp
+              cp "$FILE" "split_tmp/$BASENAME"
+
+              (
+                cd split_tmp
+                zip -s 90m -r "../downloads/${BASENAME}.zip" "$BASENAME"
+              )
+
+              rm -rf split_tmp
+            else
+              echo "✅ Copying file without split: $BASENAME"
+              cp "$FILE" "downloads/$BASENAME"
+            fi
+          done
+
+          rm -rf tmp_downloads
+
+          echo "📁 Final files in downloads/:"
+          ls -lah downloads || true
+
+      - name: Commit & Push
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME}"
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add downloads/
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Add downloaded files from commit [skip ci]"
+          echo "🚀 Pushing to branch: $BRANCH"
+          git push origin "HEAD:$BRANCH"
