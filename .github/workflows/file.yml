@@ -3,204 +3,308 @@ name: Download Local Torrent and Upload Release
 on:
   push:
     branches:
-      - "**"
+      - main
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Split mode: normal (2GB) or large (4.5GB)'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - large
 
 jobs:
-  save-file:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+  download-and-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
+    timeout-minutes: 360
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Install dependencies
-        shell: bash
+      # ===== DEBUG: Show environment =====
+      - name: Debug - Show environment
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y aria2 zip unzip file
+          echo "=== ENVIRONMENT DEBUG ==="
+          echo "Workflow dispatch mode: ${{ github.event.inputs.mode }}"
+          echo "Event name: ${{ github.event_name }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Working directory: $(pwd)"
+          echo "Disk space:"
+          df -h
+          echo ""
+          echo "=== DIRECTORY CONTENTS ==="
+          ls -laR
+          echo ""
 
       - name: Parse commit message and download local torrent
-        shell: bash
+        id: download
         run: |
-          set -Eeuo pipefail
-          shopt -s nullglob dotglob
-
-          MSG="$(git log -1 --pretty=%B)"
-
-          echo "Commit message:"
-          echo "----------------------------------------"
-          printf '%s\n' "$MSG"
-          echo "----------------------------------------"
-
-          MODE=""
-          TIMEOUT_VALUE=""
-          TORRENT_PATH=""
-
-          while IFS= read -r line; do
-            case "$line" in
-              download-zip-small:*)
-                MODE="zip"
-                TIMEOUT_VALUE="7m"
-                TORRENT_PATH="${line#download-zip-small:}"
-                break
-                ;;
-              download-zip-big:*)
-                MODE="zip"
-                TIMEOUT_VALUE="15m"
-                TORRENT_PATH="${line#download-zip-big:}"
-                break
-                ;;
-              download-small:*)
-                MODE="normal"
-                TIMEOUT_VALUE="7m"
-                TORRENT_PATH="${line#download-small:}"
-                break
-                ;;
-              download-big:*)
-                MODE="normal"
-                TIMEOUT_VALUE="15m"
-                TORRENT_PATH="${line#download-big:}"
-                break
-                ;;
-            esac
-          done <<< "$MSG"
-
-          TORRENT_PATH="$(echo "$TORRENT_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-          if [ -z "$TORRENT_PATH" ]; then
-            echo "❌ No download command found in commit message."
-            echo "Use one of:"
-            echo "  download-small: downloads/file.torrent"
-            echo "  download-big: downloads/file.torrent"
-            echo "  download-zip-small: downloads/file.torrent"
-            echo "  download-zip-big: downloads/file.torrent"
-            exit 1
-          fi
-
-          echo "✅ Mode: $MODE"
-          echo "✅ Timeout: $TIMEOUT_VALUE"
-          echo "✅ Torrent path: $TORRENT_PATH"
-
-          if [ ! -f "$TORRENT_PATH" ]; then
-            echo "❌ Torrent file not found in repository: $TORRENT_PATH"
-            echo
-            echo "Available files:"
-            find . -maxdepth 5 -type f | sort || true
-            exit 1
-          fi
-
-          echo "🧹 Cleaning generated folders only..."
-          rm -rf tmp_downloads prepared_outputs release_files logs split_tmp
-          mkdir -p tmp_downloads prepared_outputs release_files logs
-
-          echo "⬇️ Starting torrent download..."
-          if ! timeout "$TIMEOUT_VALUE" aria2c \
-            --continue=true \
-            --max-tries=1 \
-            --retry-wait=5 \
-            --timeout=30 \
-            --connect-timeout=30 \
-            --bt-tracker-timeout=30 \
-            --bt-tracker-connect-timeout=30 \
-            --bt-stop-timeout=180 \
-            --seed-time=0 \
-            --follow-torrent=true \
-            --bt-save-metadata=true \
-            --dir="tmp_downloads" \
-            --log="logs/aria2.log" \
-            "$TORRENT_PATH"; then
-
-            echo "❌ Torrent download failed."
-
-            if grep -qi "not allowed to download" logs/aria2.log; then
-              echo "❌ Tracker denied access."
-            fi
-
-            echo "----- aria2 log -----"
-            cat logs/aria2.log || true
-            echo "---------------------"
-            exit 1
-          fi
-
-          HAS_REAL_CONTENT=0
-          while IFS= read -r f; do
-            base="$(basename "$f")"
-            if [[ "$base" != *.torrent ]]; then
-              HAS_REAL_CONTENT=1
-              break
-            fi
-          done < <(find tmp_downloads -type f)
-
-          if [ "$HAS_REAL_CONTENT" -eq 0 ]; then
-            echo "❌ No actual downloaded content found."
-            echo "----- aria2 log -----"
-            cat logs/aria2.log || true
-            echo "---------------------"
-            exit 1
-          fi
-
-          find tmp_downloads -type f -name "*.torrent" -delete
-
-          if [ "$MODE" = "zip" ]; then
-            ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
-            (
-              cd tmp_downloads
-              zip -r "../prepared_outputs/$ARCHIVE_NAME" .
-            )
+          set -e
+          
+          # ===== DEBUG: Commit message =====
+          echo "=== COMMIT MESSAGE DEBUG ==="
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Full commit message:"
+          echo "$COMMIT_MSG"
+          echo ""
+          
+          # Extract mode
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ github.event.inputs.mode }}"
+            echo "Mode from workflow_dispatch: $MODE"
           else
-            while IFS= read -r ITEM; do
-              BASENAME="$(basename "$ITEM")"
-              if [ -d "$ITEM" ]; then
-                (
-                  cd tmp_downloads
-                  zip -r "../prepared_outputs/${BASENAME}.zip" "$BASENAME"
-                )
-              elif [ -f "$ITEM" ]; then
-                cp "$ITEM" "prepared_outputs/$BASENAME"
-              fi
-            done < <(find tmp_downloads -mindepth 1 -maxdepth 1)
+            MODE=$(echo "$COMMIT_MSG" | grep -oP '(?<=mode:\s?)\w+' || echo "normal")
+            echo "Mode from commit message: $MODE"
           fi
-
-          if [ -z "$(find prepared_outputs -type f -print -quit)" ]; then
-            echo "❌ No output files prepared."
+          
+          # Extract torrent filename
+          TORRENT_FILE=$(echo "$COMMIT_MSG" | grep -oP '(?<=torrent:\s?)\S+' || echo "")
+          echo "Extracted torrent filename: '$TORRENT_FILE'"
+          
+          if [ -z "$TORRENT_FILE" ]; then
+            echo "ERROR: No torrent file specified in commit message"
+            echo "Expected format: 'torrent: filename.torrent'"
             exit 1
           fi
+          
+          # ===== DEBUG: Torrent file detection =====
+          echo ""
+          echo "=== TORRENT FILE DEBUG ==="
+          echo "Looking for: $TORRENT_FILE"
+          
+          if [ ! -f "$TORRENT_FILE" ]; then
+            echo "ERROR: Torrent file not found: $TORRENT_FILE"
+            echo "Files in current directory:"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Torrent file found!"
+          echo "File info:"
+          ls -lh "$TORRENT_FILE"
+          file "$TORRENT_FILE"
+          echo ""
+          echo "Torrent content preview:"
+          aria2c --show-files "$TORRENT_FILE" || echo "Could not preview torrent"
+          echo ""
+          
+          # Set split size
+          if [ "$MODE" = "large" ]; then
+            SPLIT_SIZE="4500M"
+            echo "Split size: $SPLIT_SIZE (large mode)"
+          else
+            SPLIT_SIZE="2000M"
+            echo "Split size: $SPLIT_SIZE (normal mode)"
+          fi
+          
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "split_size=$SPLIT_SIZE" >> $GITHUB_OUTPUT
+          
+          # ===== DEBUG: aria2c setup =====
+          echo ""
+          echo "=== ARIA2C DOWNLOAD DEBUG ==="
+          mkdir -p tmp_downloads
+          echo "Created tmp_downloads directory"
+          ls -la tmp_downloads
+          
+          echo ""
+          echo "Starting aria2c download..."
+          echo "Command: aria2c --seed-time=0 --max-upload-limit=1K --dir=tmp_downloads $TORRENT_FILE"
+          echo ""
+          
+          # Download with timeout and capture exit code
+          set +e
+          timeout 5h aria2c \
+            --seed-time=0 \
+            --max-upload-limit=1K \
+            --dir=tmp_downloads \
+            "$TORRENT_FILE"
+          ARIA2C_EXIT=$?
+          set -e
+          
+          echo ""
+          echo "aria2c exit code: $ARIA2C_EXIT"
+          
+          # ===== DEBUG: Download results =====
+          echo ""
+          echo "=== DOWNLOAD RESULTS DEBUG ==="
+          echo "tmp_downloads contents:"
+          ls -laR tmp_downloads
+          echo ""
+          echo "File count:"
+          find tmp_downloads -type f | wc -l
+          echo ""
+          echo "Total size:"
+          du -sh tmp_downloads
+          echo ""
+          
+          # Check exit code
+          if [ $ARIA2C_EXIT -eq 124 ]; then
+            echo "WARNING: Download timed out after 5 hours"
+          elif [ $ARIA2C_EXIT -ne 0 ]; then
+            echo "ERROR: aria2c failed with exit code $ARIA2C_EXIT"
+            exit 1
+          fi
+          
+          # Check for content
+          HAS_REAL_CONTENT=$(find tmp_downloads -type f -size +0 | head -n 1)
+          if [ -z "$HAS_REAL_CONTENT" ]; then
+            echo "ERROR: No files downloaded"
+            exit 1
+          fi
+          
+          echo "Download successful!"
 
-          SPLIT_SIZE="950m"
-          for FILE in prepared_outputs/*; do
-            [ -f "$FILE" ] || continue
-            BASENAME="$(basename "$FILE")"
-            SAFE_NAME="$(echo "$BASENAME" | tr ' /' '__')"
+      # ===== DEBUG: Pre-processing state =====
+      - name: Debug - Pre-processing state
+        run: |
+          echo "=== PRE-PROCESSING DEBUG ==="
+          echo "Current directory structure:"
+          ls -laR
+          echo ""
+          echo "tmp_downloads detailed listing:"
+          find tmp_downloads -type f -exec ls -lh {} \;
+          echo ""
 
-            rm -rf split_tmp
-            mkdir -p split_tmp
-            cp "$FILE" "split_tmp/$BASENAME"
-
-            (
-              cd split_tmp
-              zip -s "$SPLIT_SIZE" - "../release_files/${SAFE_NAME}.zip" "$BASENAME"
-            )
-
-            rm -rf split_tmp
+      - name: Prepare files for release
+        run: |
+          set -e
+          
+          echo "=== FILE PREPARATION DEBUG ==="
+          mkdir -p prepared_outputs
+          SPLIT_SIZE="${{ steps.download.outputs.split_size }}"
+          echo "Split size: $SPLIT_SIZE"
+          echo ""
+          
+          # Sanitize filenames
+          echo "Sanitizing filenames..."
+          find tmp_downloads -depth -name '*[^a-zA-Z0-9._-]*' -type f | while IFS= read -r -d '' FILE; do
+            DIR=$(dirname "$FILE")
+            BASE=$(basename "$FILE")
+            CLEAN=$(echo "$BASE" | tr -cs 'a-zA-Z0-9._-' '_')
+            if [ "$BASE" != "$CLEAN" ]; then
+              echo "Renaming: $BASE -> $CLEAN"
+              mv "$FILE" "$DIR/$CLEAN"
+            fi
           done
+          
+          echo ""
+          echo "Processing files..."
+          
+          # Process each file
+          find tmp_downloads -type f -print0 | while IFS= read -r -d '' FILE; do
+            echo ""
+            echo "--- Processing: $FILE ---"
+            ls -lh "$FILE"
+            
+            BASENAME=$(basename "$FILE")
+            FILESIZE=$(stat -f%z "$FILE" 2>/dev/null || stat -c%s "$FILE")
+            echo "File size: $FILESIZE bytes"
+            
+            # Check if file needs splitting
+            SPLIT_BYTES=$((${SPLIT_SIZE%M} * 1024 * 1024))
+            echo "Split threshold: $SPLIT_BYTES bytes"
+            
+            if [ "$FILESIZE" -gt "$SPLIT_BYTES" ]; then
+              echo "File exceeds split size, splitting..."
+              split -b "$SPLIT_SIZE" -d "$FILE" "prepared_outputs/${BASENAME}.part"
+              echo "Split complete. Parts created:"
+              ls -lh prepared_outputs/${BASENAME}.part*
+            else
+              echo "File under split size, zipping..."
+              zip -j "prepared_outputs/${BASENAME}.zip" "$FILE"
+              echo "Zip complete:"
+              ls -lh "prepared_outputs/${BASENAME}.zip"
+            fi
+          done
+          
+          echo ""
+          echo "=== PREPARATION COMPLETE ==="
+          echo "prepared_outputs contents:"
+          ls -lh prepared_outputs/
+          echo ""
+          echo "Total files prepared:"
+          ls prepared_outputs/ | wc -l
 
-          if [ -z "$(find release_files -type f -print -quit)" ]; then
-            echo "❌ No release assets were created."
-            exit 1
-          fi
+      # ===== DEBUG: Pre-upload state =====
+      - name: Debug - Pre-upload state
+        run: |
+          echo "=== PRE-UPLOAD DEBUG ==="
+          echo "prepared_outputs detailed listing:"
+          ls -lah prepared_outputs/
+          echo ""
+          echo "File checksums:"
+          cd prepared_outputs && md5sum * || shasum * || echo "Checksum tool not available"
+          cd ..
+          echo ""
+          echo "Disk space before upload:"
+          df -h
 
-          TAG="download-$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_NUMBER}"
-          TITLE="Downloaded files $TAG"
-
-          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "RELEASE_TITLE=$TITLE" >> "$GITHUB_ENV"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_TITLE }}
+          tag_name: release-${{ github.run_number }}
+          release_name: Download Release ${{ github.run_number }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Assets
+        run: |
+          set -e
+          
+          echo "=== UPLOAD DEBUG ==="
+          UPLOAD_URL="${{ steps.create_release.outputs.upload_url }}"
+          echo "Upload URL: $UPLOAD_URL"
+          echo ""
+          
+          cd prepared_outputs
+          
+          for FILE in *; do
+            if [ -f "$FILE" ]; then
+              echo ""
+              echo "--- Uploading: $FILE ---"
+              ls -lh "$FILE"
+              
+              echo "Executing upload..."
+              curl -X POST \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @"$FILE" \
+                "${UPLOAD_URL%\{*}?name=$FILE"
+              
+              CURL_EXIT=$?
+              echo "Upload exit code: $CURL_EXIT"
+              
+              if [ $CURL_EXIT -ne 0 ]; then
+                echo "ERROR: Upload failed for $FILE"
+                exit 1
+              fi
+              
+              echo "Upload successful!"
+            fi
+          done
+          
+          echo ""
+          echo "=== ALL UPLOADS COMPLETE ==="
+
+      # ===== DEBUG: Final state =====
+      - name: Debug - Final state
+        if: always()
+        run: |
+          echo "=== FINAL DEBUG ==="
+          echo "Disk space:"
+          df -h
+          echo ""
+          echo "All workflow outputs:"
+          echo "Mode: ${{ steps.download.outputs.mode }}"
+          echo "Split size: ${{ steps.download.outputs.split_size }}"
+          echo ""
+          echo "Job status: ${{ job.status }}"
