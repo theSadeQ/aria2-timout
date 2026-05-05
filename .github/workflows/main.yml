@@ -42,19 +42,19 @@ jobs:
           if echo "$MSG" | grep -qP 'download-zip-small:\s*'; then
             MODE="zip"
             TIMEOUT_VALUE="7m"
-            URL_LINE="$(echo "$MSG" | grep -oP 'download-zip-small:\s*\K.*')"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-zip-small:\s*\K.*' | head -n1)"
           elif echo "$MSG" | grep -qP 'download-zip-big:\s*'; then
             MODE="zip"
             TIMEOUT_VALUE="15m"
-            URL_LINE="$(echo "$MSG" | grep -oP 'download-zip-big:\s*\K.*')"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-zip-big:\s*\K.*' | head -n1)"
           elif echo "$MSG" | grep -qP 'download-small:\s*'; then
             MODE="normal"
             TIMEOUT_VALUE="7m"
-            URL_LINE="$(echo "$MSG" | grep -oP 'download-small:\s*\K.*')"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-small:\s*\K.*' | head -n1)"
           elif echo "$MSG" | grep -qP 'download-big:\s*'; then
             MODE="normal"
             TIMEOUT_VALUE="15m"
-            URL_LINE="$(echo "$MSG" | grep -oP 'download-big:\s*\K.*')"
+            URL_LINE="$(echo "$MSG" | grep -oP 'download-big:\s*\K.*' | head -n1)"
           else
             echo "❌ No valid download command found."
             echo "Use one of:"
@@ -73,6 +73,7 @@ jobs:
           echo "Mode: $MODE"
           echo "Timeout: $TIMEOUT_VALUE"
 
+          rm -rf downloads tmp_downloads final_downloads split_tmp
           mkdir -p downloads tmp_downloads
 
           download_one() {
@@ -93,28 +94,55 @@ jobs:
               --bt-stop-timeout=180 \
               --seed-time=0 \
               --follow-torrent=mem \
-              --bt-save-metadata=false \
+              --bt-save-metadata=true \
               --dir="tmp_downloads" \
               "$url"
           }
 
-          for URL in $URL_LINE; do
+          # Support one URL per line, safer than splitting on spaces.
+          while IFS= read -r URL; do
+            [ -n "${URL// }" ] || continue
             if ! download_one "$URL"; then
               echo "❌ Download failed or timed out: $URL"
               exit 1
             fi
-          done
+          done <<< "$URL_LINE"
 
-          echo "🧹 Removing leftover .torrent files, if any..."
+          echo "📁 Raw downloaded content:"
+          find tmp_downloads -maxdepth 4 -print || true
+
+          echo "🔎 File type inspection:"
+          find tmp_downloads -type f -maxdepth 4 -exec file {} \; || true
+
+          # Check for real content before deleting .torrent files
+          HAS_REAL_CONTENT=0
+          while IFS= read -r f; do
+            base="$(basename "$f")"
+            if [[ "$base" != *.torrent ]]; then
+              HAS_REAL_CONTENT=1
+              break
+            fi
+          done < <(find tmp_downloads -type f)
+
+          if [ "$HAS_REAL_CONTENT" -eq 0 ]; then
+            echo "❌ No real downloaded payload found."
+            echo "Only .torrent metadata or no files were downloaded."
+            echo "Possible reasons:"
+            echo "  - the URL only returns a .torrent file"
+            echo "  - the torrent had no reachable peers"
+            echo "  - the timeout was too short"
+            echo "  - the site returned an HTML/error page instead of a file"
+            exit 1
+          fi
+
+          echo "🧹 Removing leftover .torrent files..."
           find tmp_downloads -type f -name "*.torrent" -delete
 
-          echo "📁 Downloaded content:"
-          find tmp_downloads -maxdepth 3 -print
+          echo "📁 Downloaded content after cleanup:"
+          find tmp_downloads -maxdepth 4 -print || true
 
           if [ "$MODE" = "zip" ]; then
-            FILES=(tmp_downloads/*)
-
-            if [ "${#FILES[@]}" -eq 0 ]; then
+            if [ -z "$(find tmp_downloads -mindepth 1 -print -quit)" ]; then
               echo "❌ No files downloaded to archive."
               exit 1
             fi
@@ -122,7 +150,6 @@ jobs:
             ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
 
             echo "📦 Creating one archive from downloaded content: $ARCHIVE_NAME"
-
             (
               cd tmp_downloads
               zip -r "../downloads/$ARCHIVE_NAME" .
@@ -131,20 +158,17 @@ jobs:
           else
             echo "📤 Preparing normal output..."
 
-            ITEMS=(tmp_downloads/*)
-
-            if [ "${#ITEMS[@]}" -eq 0 ]; then
+            if [ -z "$(find tmp_downloads -mindepth 1 -print -quit)" ]; then
               echo "❌ No downloaded content found."
               exit 1
             fi
 
-            for ITEM in "${ITEMS[@]}"; do
+            while IFS= read -r ITEM; do
               BASENAME="$(basename "$ITEM")"
 
               if [ -d "$ITEM" ]; then
                 echo "📁 Torrent produced folder: $BASENAME"
                 echo "📦 Zipping folder so it can be stored cleanly..."
-
                 (
                   cd tmp_downloads
                   zip -r "../downloads/${BASENAME}.zip" "$BASENAME"
@@ -154,7 +178,7 @@ jobs:
                 echo "✅ Copying downloaded file: $BASENAME"
                 cp "$ITEM" "downloads/$BASENAME"
               fi
-            done
+            done < <(find tmp_downloads -mindepth 1 -maxdepth 1)
           fi
 
           rm -rf tmp_downloads
