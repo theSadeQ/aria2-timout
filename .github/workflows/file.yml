@@ -9,7 +9,6 @@ jobs:
   save-file:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
 
@@ -21,7 +20,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           sudo apt-get update
           sudo apt-get install -y aria2 zip unzip file
 
@@ -75,7 +73,6 @@ jobs:
 
           if [ -z "$TORRENT_PATH" ]; then
             echo "❌ No download command found in commit message."
-            echo
             echo "Use one of:"
             echo "  download-small: downloads/file.torrent"
             echo "  download-big: downloads/file.torrent"
@@ -96,12 +93,8 @@ jobs:
             exit 1
           fi
 
-          echo "🔍 Torrent file info:"
-          file "$TORRENT_PATH" || true
-
           echo "🧹 Cleaning generated folders only..."
           rm -rf tmp_downloads prepared_outputs release_files logs split_tmp
-
           mkdir -p tmp_downloads prepared_outputs release_files logs
 
           echo "⬇️ Starting torrent download..."
@@ -125,29 +118,17 @@ jobs:
 
             if grep -qi "not allowed to download" logs/aria2.log; then
               echo "❌ Tracker denied access."
-              echo "This means the tracker rejected the GitHub runner."
-              echo "If it is a private tracker, the torrent/passkey/account may not allow this download."
             fi
 
-            echo
             echo "----- aria2 log -----"
             cat logs/aria2.log || true
             echo "---------------------"
-
             exit 1
           fi
 
-          echo "📁 Download tree:"
-          find tmp_downloads -maxdepth 5 -print || true
-
-          echo "🔎 Downloaded file types:"
-          find tmp_downloads -maxdepth 5 -type f -exec file {} \; || true
-
           HAS_REAL_CONTENT=0
-
           while IFS= read -r f; do
             base="$(basename "$f")"
-
             if [[ "$base" != *.torrent ]]; then
               HAS_REAL_CONTENT=1
               break
@@ -156,58 +137,29 @@ jobs:
 
           if [ "$HAS_REAL_CONTENT" -eq 0 ]; then
             echo "❌ No actual downloaded content found."
-            echo "Only torrent metadata or nothing was downloaded."
-            echo
-            echo "Possible causes:"
-            echo "  - tracker denied access"
-            echo "  - no peers"
-            echo "  - torrent has no downloadable payload"
-            echo "  - timeout was too short"
-            echo
             echo "----- aria2 log -----"
             cat logs/aria2.log || true
             echo "---------------------"
-
             exit 1
           fi
 
-          echo "🧹 Removing leftover .torrent files from downloaded content only..."
           find tmp_downloads -type f -name "*.torrent" -delete
 
-          echo "📁 Content after cleanup:"
-          find tmp_downloads -maxdepth 5 -print || true
-
           if [ "$MODE" = "zip" ]; then
-            if [ -z "$(find tmp_downloads -mindepth 1 -print -quit)" ]; then
-              echo "❌ No files downloaded to archive."
-              exit 1
-            fi
-
             ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
-
-            echo "📦 Creating archive: $ARCHIVE_NAME"
-
             (
               cd tmp_downloads
               zip -r "../prepared_outputs/$ARCHIVE_NAME" .
             )
           else
-            echo "📤 Preparing downloaded outputs..."
-
             while IFS= read -r ITEM; do
               BASENAME="$(basename "$ITEM")"
-
               if [ -d "$ITEM" ]; then
-                echo "📁 Found directory: $BASENAME"
-                echo "📦 Zipping directory..."
-
                 (
                   cd tmp_downloads
                   zip -r "../prepared_outputs/${BASENAME}.zip" "$BASENAME"
                 )
-
               elif [ -f "$ITEM" ]; then
-                echo "✅ Copying file: $BASENAME"
                 cp "$ITEM" "prepared_outputs/$BASENAME"
               fi
             done < <(find tmp_downloads -mindepth 1 -maxdepth 1)
@@ -218,29 +170,19 @@ jobs:
             exit 1
           fi
 
-          echo "📁 Prepared outputs:"
-          ls -lah prepared_outputs
-
-          echo "📦 Splitting outputs into GitHub-release-safe assets..."
           SPLIT_SIZE="950m"
-
           for FILE in prepared_outputs/*; do
             [ -f "$FILE" ] || continue
-
             BASENAME="$(basename "$FILE")"
-
             SAFE_NAME="$(echo "$BASENAME" | tr ' /' '__')"
-
-            echo "Processing output: $BASENAME"
 
             rm -rf split_tmp
             mkdir -p split_tmp
-
             cp "$FILE" "split_tmp/$BASENAME"
 
             (
               cd split_tmp
-              zip -s "$SPLIT_SIZE" -r "../release_files/${SAFE_NAME}.zip" "$BASENAME"
+              zip -s "$SPLIT_SIZE" - "../release_files/${SAFE_NAME}.zip" "$BASENAME"
             )
 
             rm -rf split_tmp
@@ -250,9 +192,6 @@ jobs:
             echo "❌ No release assets were created."
             exit 1
           fi
-
-          echo "📁 Release assets:"
-          ls -lah release_files
 
           TAG="download-$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_NUMBER}"
           TITLE="Downloaded files $TAG"
@@ -265,13 +204,3 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TITLE }}
-          body: |
-            Automated release created from a local torrent file in the repository.
-
-            Commit: ${{ github.sha }}
-            Branch: ${{ github.ref_name }}
-
-            Torrent path was read from the commit message.
-          files: release_files/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
