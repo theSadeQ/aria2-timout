@@ -1,4 +1,4 @@
-name: Download from Commit & Save to Repo
+name: Download from Commit & Upload to Release
 
 on:
   push:
@@ -15,15 +15,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 zip unzip
 
-      - name: Extract URLs, download files, and prepare outputs
+      - name: Extract URLs, download files, and prepare release assets
         shell: bash
         run: |
           set -euo pipefail
@@ -73,8 +71,8 @@ jobs:
           echo "Mode: $MODE"
           echo "Timeout: $TIMEOUT_VALUE"
 
-          rm -rf downloads tmp_downloads final_downloads split_tmp
-          mkdir -p downloads tmp_downloads
+          rm -rf downloads tmp_downloads release_files split_tmp
+          mkdir -p downloads tmp_downloads release_files
 
           download_one() {
             local url="$1"
@@ -99,7 +97,6 @@ jobs:
               "$url"
           }
 
-          # Support one URL per line, safer than splitting on spaces.
           while IFS= read -r URL; do
             [ -n "${URL// }" ] || continue
             if ! download_one "$URL"; then
@@ -112,9 +109,8 @@ jobs:
           find tmp_downloads -maxdepth 4 -print || true
 
           echo "🔎 File type inspection:"
-          find tmp_downloads -type f -maxdepth 4 -exec file {} \; || true
+          find tmp_downloads -maxdepth 4 -type f -exec file {} \; || true
 
-          # Check for real content before deleting .torrent files
           HAS_REAL_CONTENT=0
           while IFS= read -r f; do
             base="$(basename "$f")"
@@ -127,11 +123,6 @@ jobs:
           if [ "$HAS_REAL_CONTENT" -eq 0 ]; then
             echo "❌ No real downloaded payload found."
             echo "Only .torrent metadata or no files were downloaded."
-            echo "Possible reasons:"
-            echo "  - the URL only returns a .torrent file"
-            echo "  - the torrent had no reachable peers"
-            echo "  - the timeout was too short"
-            echo "  - the site returned an HTML/error page instead of a file"
             exit 1
           fi
 
@@ -149,12 +140,11 @@ jobs:
 
             ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
 
-            echo "📦 Creating one archive from downloaded content: $ARCHIVE_NAME"
+            echo "📦 Creating archive from downloaded content: $ARCHIVE_NAME"
             (
               cd tmp_downloads
               zip -r "../downloads/$ARCHIVE_NAME" .
             )
-
           else
             echo "📤 Preparing normal output..."
 
@@ -173,7 +163,6 @@ jobs:
                   cd tmp_downloads
                   zip -r "../downloads/${BASENAME}.zip" "$BASENAME"
                 )
-
               elif [ -f "$ITEM" ]; then
                 echo "✅ Copying downloaded file: $BASENAME"
                 cp "$ITEM" "downloads/$BASENAME"
@@ -183,58 +172,54 @@ jobs:
 
           rm -rf tmp_downloads
 
-          echo "🔍 Checking files larger than 90 MB..."
-          LIMIT=$((90 * 1024 * 1024))
-          mkdir -p final_downloads
+          echo "📦 Preparing release assets (split under 1 GB)..."
+          SPLIT_SIZE="950m"
 
           for FILE in downloads/*; do
             [ -f "$FILE" ] || continue
 
-            SIZE="$(stat -c%s "$FILE")"
             BASENAME="$(basename "$FILE")"
+            echo "Processing: $BASENAME"
 
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ Splitting large file: $BASENAME ($(( SIZE / 1024 / 1024 )) MB)"
+            rm -rf split_tmp
+            mkdir -p split_tmp
+            cp "$FILE" "split_tmp/$BASENAME"
 
-              rm -rf split_tmp
-              mkdir -p split_tmp
-              cp "$FILE" "split_tmp/$BASENAME"
+            (
+              cd split_tmp
+              zip -s "$SPLIT_SIZE" -r "../release_files/${BASENAME}.zip" "$BASENAME"
+            )
 
-              (
-                cd split_tmp
-                zip -s 90m -r "../final_downloads/${BASENAME}.zip" "$BASENAME"
-              )
-
-              rm -rf split_tmp
-            else
-              echo "✅ Keeping file without split: $BASENAME"
-              cp "$FILE" "final_downloads/$BASENAME"
-            fi
+            rm -rf split_tmp
           done
 
-          rm -rf downloads
-          mv final_downloads downloads
-
-          echo "📁 Final files in downloads/:"
-          ls -lah downloads || true
-
-      - name: Commit & Push
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BRANCH="${GITHUB_REF_NAME}"
-
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          git add downloads/
-
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-            exit 0
+          if [ -z "$(find release_files -type f -print -quit)" ]; then
+            echo "❌ No release assets were created."
+            exit 1
           fi
 
-          git commit -m "Add downloaded files from commit [skip ci]"
-          echo "🚀 Pushing to branch: $BRANCH"
-          git push origin "HEAD:$BRANCH"
+          echo "📁 Final release assets:"
+          ls -lah release_files
+
+          TAG="download-$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_NUMBER}"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+          RELEASE_TITLE="Downloaded files $TAG"
+          echo "RELEASE_TITLE=$RELEASE_TITLE" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TITLE }}
+          body: |
+            Automated release created from commit-triggered download workflow.
+
+            Commit:
+            ${{ github.sha }}
+
+            Branch:
+            ${{ github.ref_name }}
+          files: release_files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
