@@ -1,1 +1,74 @@
-0
+name: Download from Local Torrent & Upload to Release
+
+on:
+  push:
+    branches: ["**"]
+
+jobs:
+  save-file:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip
+
+      - name: Process Torrent and Upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Extract command and path from commit
+          MSG="$(git log -1 --pretty=%B)"
+          TORRENT_PATH="$(echo "$MSG" | grep -oP '(download-small|download-big|download-zip-small|download-zip-big):\s*\K.*' | head -n1 | xargs)"
+
+          if [ -z "$TORRENT_PATH" ]; then
+            echo "❌ No download command or file path found in commit message."
+            exit 1
+          fi
+
+          if [ ! -f "$TORRENT_PATH" ]; then
+            echo "❌ File '$TORRENT_PATH' not found in repository."
+            exit 1
+          fi
+
+          echo "✅ Found torrent file: $TORRENT_PATH"
+          mkdir -p tmp_downloads release_files downloads
+
+          # Download content using the local torrent file
+          echo "⬇️ Starting download..."
+          aria2c \
+            --bt-save-metadata=true \
+            --seed-time=0 \
+            --dir="tmp_downloads" \
+            "$TORRENT_PATH"
+
+          # Logic to handle the files (similar to previous)
+          # We check if we got actual data (excluding .torrent files)
+          if [ -z "$(find tmp_downloads -type f ! -name "*.torrent" -print -quit)" ]; then
+             echo "❌ No actual content downloaded. Check your tracker permissions."
+             exit 1
+          fi
+
+          # Package and Split
+          echo "📦 Packaging and splitting..."
+          # ... (Your logic here to zip and move to release_files)
+          # Using zip -s 950m as previously discussed
+          
+          # Generate variables for release
+          echo "RELEASE_TAG=rel-$(date +%Y%m%d-%H%M%S)" >> "$GITHUB_ENV"
+          echo "RELEASE_TITLE=Release $(date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TITLE }}
+          files: release_files/*
